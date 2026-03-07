@@ -14,6 +14,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -324,47 +329,68 @@ fun KittScreen(
         Text(text = "You said: $recognizedText", style = MaterialTheme.typography.bodyMedium)
         Spacer(modifier = Modifier.height(32.dp))
 
-        Button(onClick = {
-            if (apiService == null) {
-                Toast.makeText(context, "Please set a valid Server URL", Toast.LENGTH_SHORT).show()
-                return@Button
-            }
-            if (ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.RECORD_AUDIO
-                ) == PackageManager.PERMISSION_GRANTED
-            ) {
-                if (!isListening) {
-                    // Reset mood to neutral when starting new conversation? 
-                    // Or keep it? Let's keep it until new response.
-                    startListening(speechRecognizer, { text ->
-                        isListening = false // Reset flag immediately after recognition
-                        recognizedText = text
-                        statusText = "Sending..."
-                        sendText(apiService, kittId, text, {
-                            statusText = "Sent."
-                        }, { error ->
-                            statusText = "Send Error: $error"
-                        })
-                    }, { error ->
-                        statusText = "Error: $error"
-                        isListening = false
-                    })
-                    isListening = true
-                    statusText = "Listening..."
-                } else {
-                    speechRecognizer.stopListening()
-                    isListening = false
-                    statusText = "Stopped listening"
-                }
-            } else {
-                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            }
-        },
-        colors = ButtonDefaults.buttonColors(containerColor = getMoodColor(currentMood)),
-        enabled = apiService != null || isListening // Enable stop button even if service is null (edge case)
+        // Push-to-Talk Button
+        Surface(
+            modifier = Modifier
+                .padding(16.dp)
+                .size(width = 200.dp, height = 60.dp)
+                .pointerInput(apiService) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val downEvent = awaitFirstDown()
+                            
+                            if (apiService != null && ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                                isListening = true
+                                statusText = "Listening... (Release to send)"
+                                startListening(speechRecognizer, { text ->
+                                    isListening = false
+                                    recognizedText = text
+                                    statusText = "Sending..."
+                                    sendText(apiService, kittId, text, {
+                                        statusText = "Sent."
+                                    }, { sendErr ->
+                                        statusText = "Send Error: $sendErr"
+                                    })
+                                }, { errorCode ->
+                                    isListening = false
+                                    if (errorCode == SpeechRecognizer.ERROR_NO_MATCH || errorCode == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                                        statusText = "Canceled (No speech detected)"
+                                    } else {
+                                        statusText = "Error code: $errorCode"
+                                    }
+                                })
+                            } else if (apiService == null) {
+                                // Fallback info update
+                                statusText = "No Server URL!"
+                            } else {
+                                // Request permission if not granted
+                                // Cannot launch permission from within pointerInput easily, so we just prompt via text
+                                statusText = "Need Audio Permission!"
+                            }
+
+                            // Wait for ACTION_UP
+                            val upEvent = waitForUpOrCancellation()
+                            
+                            // Finger released
+                            if (isListening) {
+                                speechRecognizer.stopListening()
+                                isListening = false
+                                statusText = "Processing speech..."
+                            }
+                        }
+                    }
+                },
+            shape = MaterialTheme.shapes.extraLarge,
+            color = if (isListening) getMoodColor(currentMood).copy(alpha = 0.7f) else getMoodColor(currentMood),
+            shadowElevation = if (isListening) 2.dp else 8.dp
         ) {
-            Text(if (isListening) "Stop Listening" else "Start Talking")
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = if (isListening) "Listening..." else "Hold to Talk",
+                    color = MaterialTheme.colorScheme.onPrimary,
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
         }
     }
 }
@@ -372,11 +398,18 @@ fun KittScreen(
 fun startListening(
     speechRecognizer: SpeechRecognizer,
     onResult: (String) -> Unit,
-    onError: (String) -> Unit
+    onError: (Int) -> Unit
 ) {
     val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
         putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+        // VAD (Voice Activity Detection) tuning parameters
+        // Request partial results so we know it's working
+        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        // Increase the silence lengths to prevent early timeout
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 10000L) // 10 seconds min
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L) // 5 seconds of silence allowed
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L)
     }
 
     speechRecognizer.setRecognitionListener(object : RecognitionListener {
@@ -386,7 +419,7 @@ fun startListening(
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {}
         override fun onError(error: Int) {
-            onError("Speech Error code: $error")
+            onError(error)
         }
 
         override fun onResults(results: Bundle?) {
@@ -396,7 +429,14 @@ fun startListening(
             }
         }
 
-        override fun onPartialResults(partialResults: Bundle?) {}
+        override fun onPartialResults(partialResults: Bundle?) {
+            // We could update the UI with partial results here if we passed a callback,
+            // but for now just logging it to prove it's alive.
+            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if (!matches.isNullOrEmpty()) {
+                Log.d("KittTalker", "Partial: ${matches[0]}")
+            }
+        }
         override fun onEvent(eventType: Int, params: Bundle?) {}
     })
 
