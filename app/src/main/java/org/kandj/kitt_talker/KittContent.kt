@@ -11,6 +11,19 @@ data class KittContent(
     val audioPath: String?
 )
 
+data class KittAudioResponse(
+    val status: String,
+    val text: String?,
+    val reply: String?,
+    val mood: String?,
+    val action: String?,
+    val parameter: String?,
+    @SerializedName("audio_path")
+    val audioPath: String?,
+    val message: String?,
+    val error: String?
+)
+
 data class Kitt(
     val id: String,
     val name: String,

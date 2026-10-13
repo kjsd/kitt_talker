@@ -1,51 +1,71 @@
 package org.kandj.kitt_talker
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Log
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import okhttp3.MediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody
 import org.kandj.kitt_talker.ui.theme.KittTalkerTheme
 import retrofit2.Call
 import retrofit2.Callback
 import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
-import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+enum class InteractionState {
+    IDLE,           // 待機停止中
+    LISTENING,      // マイク待受中 (VAD稼働中)
+    HEARING,        // ユーザーが話し中 (音声入力検出中)
+    SENDING,        // 録音完了、サーバーSTT(Whisper)へ送信中
+    WAITING_REPLY,  // Kittの返答待ち (音声生成ポーリング中)
+    PLAYING         // Kittが音声再生中 (エコー防止のためマイクミュート)
+}
+
 class MainActivity : ComponentActivity() {
-    private lateinit var speechRecognizer: SpeechRecognizer
     private lateinit var exoPlayer: ExoPlayer
-    // apiService will be managed in Compose state
-    
+
     // Default values
-    private val DEFAULT_KITT_ID = "2d16ba43-3eb0-46c2-9583-e38dbb82c5fa" 
+    private val DEFAULT_KITT_ID = "2d16ba43-3eb0-46c2-9583-e38dbb82c5fa"
     private val DEFAULT_BASE_URL = ""
 
     private fun getSavedKittId(): String {
@@ -70,8 +90,6 @@ class MainActivity : ComponentActivity() {
 
     private fun createApiService(baseUrl: String): KittApiService? {
         if (baseUrl.isBlank()) return null
-        
-        // Simple check for valid URL format (must verify scheme)
         if (!baseUrl.startsWith("http://") && !baseUrl.startsWith("https://")) return null
 
         val okHttpClient = OkHttpClient.Builder()
@@ -81,8 +99,9 @@ class MainActivity : ComponentActivity() {
             .build()
 
         return try {
+            val normalizedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
             val retrofit = Retrofit.Builder()
-                .baseUrl(baseUrl)
+                .baseUrl(normalizedUrl)
                 .client(okHttpClient)
                 .addConverterFactory(GsonConverterFactory.create())
                 .build()
@@ -96,28 +115,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 展示・対話中のスリープ・スタンバイを無効化 (Keep Screen On)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         // Init ExoPlayer
         exoPlayer = ExoPlayer.Builder(this).build()
-        exoPlayer.addListener(object : androidx.media3.common.Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                when (playbackState) {
-                    androidx.media3.common.Player.STATE_ENDED -> {
-                        Log.d("KittTalker", "ExoPlayer: Playback Ended")
-                    }
-                    androidx.media3.common.Player.STATE_READY -> {
-                        Log.d("KittTalker", "ExoPlayer: Ready to play")
-                    }
-                    else -> {}
-                }
-            }
-
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                Log.e("KittTalker", "ExoPlayer Error: ${error.message}", error)
-            }
-        })
-
-        // Init SpeechRecognizer
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
 
         setContent {
             KittTalkerTheme {
@@ -127,14 +129,12 @@ class MainActivity : ComponentActivity() {
                 ) {
                     var kittId by remember { mutableStateOf(getSavedKittId()) }
                     var baseUrl by remember { mutableStateOf(getSavedBaseUrl()) }
-                    
-                    // Recreate ApiService when baseUrl changes
+
                     val apiService = remember(baseUrl) {
                         createApiService(baseUrl)
                     }
-                    
+
                     KittScreen(
-                        speechRecognizer = speechRecognizer,
                         exoPlayer = exoPlayer,
                         apiService = apiService,
                         kittId = kittId,
@@ -155,7 +155,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        speechRecognizer.destroy()
         exoPlayer.release()
     }
 }
@@ -163,7 +162,6 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun KittScreen(
-    speechRecognizer: SpeechRecognizer,
     exoPlayer: ExoPlayer,
     apiService: KittApiService?,
     kittId: String,
@@ -171,20 +169,207 @@ fun KittScreen(
     baseUrl: String,
     onBaseUrlChanged: (String) -> Unit
 ) {
-    var statusText by remember { mutableStateOf(if (apiService == null) "Set Server URL" else "Ready") }
-    // ... (rest of state vars) ...
+    var interactionState by remember { mutableStateOf(InteractionState.IDLE) }
+    var statusText by remember { mutableStateOf(if (apiService == null) "Set Server URL" else "Initializing...") }
     var recognizedText by remember { mutableStateOf("") }
     var currentMood by remember { mutableStateOf("neutral") }
-    var isListening by remember { mutableStateOf(false) }
-    
+
     // Kitt Selection State
     var kitts by remember { mutableStateOf(emptyList<Kitt>()) }
     var expanded by remember { mutableStateOf(false) }
-    
-    val context = LocalContext.current
 
-    // Initial load of Kitts (Reload when apiService changes)
-    LaunchedEffect(apiService) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val isAudioPlaying = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val isSendingAudio = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+
+    val currentApiService by rememberUpdatedState(apiService)
+    val currentKittId by rememberUpdatedState(kittId)
+    val currentBaseUrl by rememberUpdatedState(baseUrl)
+
+    // VoiceActivityDetector: アプリ起動中ずっと単一インスタンスを保持
+    val vad = remember {
+        VoiceActivityDetector(
+            onSpeechStarted = {
+                scope.launch(Dispatchers.Main) {
+                    Log.i("KittTalker", "VAD: User started speaking")
+                    interactionState = InteractionState.HEARING
+                    statusText = "Hearing voice..."
+                }
+            },
+            onSpeechEnded = { wavBytes ->
+                // 重複送信防止 (In-Flight Lock)
+                if (isSendingAudio.getAndSet(true)) {
+                    Log.w("KittTalker", "VAD: Already sending audio, ignoring duplicate speech end")
+                    return@VoiceActivityDetector
+                }
+
+                scope.launch(Dispatchers.Main) {
+                    Log.i("KittTalker", "VAD: Speech ended (${wavBytes.size} bytes). Sending to Kitt...")
+                    interactionState = InteractionState.SENDING
+                    statusText = "Thinking..."
+
+                    val service = currentApiService
+                    val id = currentKittId
+                    val url = currentBaseUrl
+
+                    if (service == null) {
+                        isSendingAudio.set(false)
+                        statusText = "Error: Server not connected"
+                        interactionState = InteractionState.IDLE
+                        return@launch
+                    }
+
+                    sendAudio(
+                        apiService = service,
+                        id = id,
+                        wavBytes = wavBytes,
+                        onSuccess = { res ->
+                            isSendingAudio.set(false)
+                            if (res.status == "ignored") {
+                                Log.i("KittTalker", "STT ignored: ${res.message}")
+                                interactionState = InteractionState.LISTENING
+                                statusText = "Listening (Ready)..."
+                            } else {
+                                Log.i("KittTalker", "STT Text: \"${res.text}\", Reply: \"${res.reply}\"")
+                                recognizedText = res.text ?: ""
+                                currentMood = res.mood ?: "neutral"
+
+                                if (!res.audioPath.isNullOrBlank()) {
+                                    // 音声パスが即座に返ってきた場合
+                                    interactionState = InteractionState.PLAYING
+                                    statusText = "Kitt is talking..."
+                                    playAudio(exoPlayer, url, res.audioPath)
+                                } else {
+                                    // 非同期TTS生成中の場合、ポーリングで待機
+                                    interactionState = InteractionState.WAITING_REPLY
+                                    statusText = "Kitt is thinking..."
+                                }
+                            }
+                        },
+                        onError = { error ->
+                            isSendingAudio.set(false)
+                            Log.e("KittTalker", "STT Error: $error")
+                            statusText = "STT Error: $error"
+                            scope.launch {
+                                delay(1500)
+                                if (!isAudioPlaying.get() && interactionState != InteractionState.PLAYING) {
+                                    interactionState = InteractionState.LISTENING
+                                    statusText = "Listening (Ready)..."
+                                }
+                            }
+                        }
+                    )
+                }
+            },
+            checkIsMuted = {
+                isAudioPlaying.get() ||
+                        isSendingAudio.get() ||
+                        interactionState == InteractionState.PLAYING ||
+                        interactionState == InteractionState.SENDING ||
+                        interactionState == InteractionState.WAITING_REPLY
+            }
+        )
+    }
+
+    // Permission launcher
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            vad.start()
+            interactionState = InteractionState.LISTENING
+            statusText = "Listening (Ready)..."
+        } else {
+            Toast.makeText(context, "Audio permission needed for Kitt", Toast.LENGTH_SHORT).show()
+            statusText = "Audio Permission Denied"
+            interactionState = InteractionState.IDLE
+        }
+    }
+
+    // ライフサイクル連動: フォアグラウンド(ON_RESUME)時のみマイク待受、非表示(ON_PAUSE/STOP)時は停止
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, vad) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                        vad.start()
+                        if (interactionState == InteractionState.IDLE) {
+                            interactionState = InteractionState.LISTENING
+                            statusText = "Listening (Ready)..."
+                        }
+                    } else {
+                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    vad.stop()
+                    if (interactionState == InteractionState.LISTENING || interactionState == InteractionState.HEARING) {
+                        interactionState = InteractionState.IDLE
+                        statusText = "Paused"
+                    }
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            vad.stop()
+        }
+    }
+
+    // ExoPlayer Listener: 再生完了時にエコーガードディレイを挟んで待受復帰
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                isAudioPlaying.set(isPlaying)
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                when (playbackState) {
+                    Player.STATE_ENDED -> {
+                        isAudioPlaying.set(false)
+                        Log.d("KittTalker", "ExoPlayer: Playback Ended")
+                        interactionState = InteractionState.IDLE
+                        statusText = "Finished speaking."
+
+                        // エコー防止（残響カット）のため 600ms 待機してから待受復帰
+                        scope.launch {
+                            delay(600)
+                            interactionState = InteractionState.LISTENING
+                            statusText = "Listening (Ready)..."
+                        }
+                    }
+                    Player.STATE_READY -> {
+                        Log.d("KittTalker", "ExoPlayer: Ready to play")
+                    }
+                    else -> {}
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                isAudioPlaying.set(false)
+                Log.e("KittTalker", "ExoPlayer Error: ${error.message}", error)
+                statusText = "Playback error"
+                interactionState = InteractionState.IDLE
+                scope.launch {
+                    delay(1000)
+                    interactionState = InteractionState.LISTENING
+                    statusText = "Listening (Ready)..."
+                }
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+        }
+    }
+
+    // Initial load of Kitts (Reload when baseUrl changes)
+    LaunchedEffect(baseUrl) {
         apiService?.getKitts()?.enqueue(object : Callback<List<Kitt>> {
             override fun onResponse(call: Call<List<Kitt>>, response: Response<List<Kitt>>) {
                 if (response.isSuccessful) {
@@ -196,45 +381,25 @@ fun KittScreen(
             }
         })
     }
-    
-    // ... (Permission launcher) ...
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted: Boolean ->
-        // ... (inside logic remains same, just ensuring context) ...
-        if (isGranted) {
-            startListening(speechRecognizer, { text ->
-                recognizedText = text
-                statusText = "Sending..."
-                if (apiService != null) {
-                    sendText(apiService, kittId, text, {
-                        statusText = "Sent. Waiting for reply..."
-                    }, { error ->
-                        statusText = "Send Error: $error"
-                    })
-                } else {
-                    statusText = "Error: Invalid Server URL"
-                }
-            }, { error ->
-                statusText = "Error: $error"
-                isListening = false
-            })
-            isListening = true
-            statusText = "Listening..."
-        } else {
-            Toast.makeText(context, "Permission needed", Toast.LENGTH_SHORT).show()
-        }
-    }
 
-    // Polling effect
-    LaunchedEffect(apiService, kittId) {
+    // Polling effect: 返答待ち時は 500ms、通常時は 2000ms でポーリング
+    LaunchedEffect(baseUrl, kittId) {
         while (true) {
-            delay(2000) // Poll every 2 seconds
-            
-            if (!isListening && !exoPlayer.isPlaying && apiService != null) {
+            val pollDelay = if (interactionState == InteractionState.WAITING_REPLY) 500L else 2000L
+            delay(pollDelay)
+
+            // ユーザー発話中(HEARING)・送信中(SENDING)・再生中(PLAYING)はポーリングからの再生割り込みを避ける
+            if (interactionState != InteractionState.HEARING &&
+                interactionState != InteractionState.SENDING &&
+                !isSendingAudio.get() &&
+                !exoPlayer.isPlaying &&
+                apiService != null
+            ) {
                 pollForContent(apiService, kittId) { content ->
-                    if (content != null && content.audioPath != null) {
-                        statusText = "Playing audio..."
+                    if (content != null && !content.audioPath.isNullOrBlank()) {
+                        Log.i("KittTalker", "Received content from queue: ${content.message}")
+                        interactionState = InteractionState.PLAYING
+                        statusText = "Kitt is talking..."
                         currentMood = content.mood ?: "neutral"
                         playAudio(exoPlayer, baseUrl, content.audioPath)
                     }
@@ -243,10 +408,34 @@ fun KittScreen(
         }
     }
 
+    // Pulse animation for active mic / listening state
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 1.0f,
+        targetValue = if (interactionState == InteractionState.LISTENING || interactionState == InteractionState.HEARING) 1.15f else 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulseScale"
+    )
+
+    val coreColor by animateColorAsState(
+        targetValue = when (interactionState) {
+            InteractionState.PLAYING -> getMoodColor(currentMood)
+            InteractionState.HEARING -> Color(0xFFFF9800) // Orange while hearing voice
+            InteractionState.SENDING, InteractionState.WAITING_REPLY -> Color(0xFF9C27B0) // Purple while waiting
+            InteractionState.LISTENING -> Color(0xFF4CAF50) // Green while listening
+            InteractionState.IDLE -> Color(0xFF757575) // Grey when idle
+        },
+        label = "coreColor"
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
+            .padding(20.dp)
+            .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -257,7 +446,7 @@ fun KittScreen(
             label = { Text("Server URL") },
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 16.dp),
+                .padding(bottom = 8.dp),
             singleLine = true,
             isError = apiService == null
         )
@@ -266,7 +455,7 @@ fun KittScreen(
         ExposedDropdownMenuBox(
             expanded = expanded,
             onExpandedChange = { expanded = !expanded },
-            modifier = Modifier.padding(bottom = 32.dp)
+            modifier = Modifier.padding(bottom = 24.dp)
         ) {
             val selectedKitt = kitts.find { it.id == kittId }
             TextField(
@@ -275,7 +464,8 @@ fun KittScreen(
                 readOnly = true,
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                 colors = ExposedDropdownMenuDefaults.textFieldColors(),
-                modifier = Modifier.menuAnchor()
+                modifier = Modifier.menuAnchor(),
+                textStyle = MaterialTheme.typography.bodyMedium
             )
             ExposedDropdownMenu(
                 expanded = expanded,
@@ -285,7 +475,7 @@ fun KittScreen(
                     DropdownMenuItem(
                         text = {
                             Column {
-                                Text(kitt.name, style = MaterialTheme.typography.bodyLarge)
+                                Text(kitt.name, style = MaterialTheme.typography.bodyMedium)
                                 kitt.biography?.personality?.let {
                                     Text(it, style = MaterialTheme.typography.bodySmall, maxLines = 1)
                                 }
@@ -300,167 +490,98 @@ fun KittScreen(
             }
         }
 
-        // Mood Indicator
+        // Mood / Interaction Indicator (タップで強制リフレッシュ/再リッスン可能なトリガー付き)
         Box(
             modifier = Modifier
-                .size(120.dp)
-                .padding(bottom = 32.dp),
+                .size(130.dp)
+                .padding(bottom = 20.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) {
+                    if (!exoPlayer.isPlaying && apiService != null) {
+                        interactionState = InteractionState.LISTENING
+                        statusText = "Listening (Ready)..."
+                    }
+                },
             contentAlignment = Alignment.Center
         ) {
-            // Outer glow or circle
+            // Outer glow circle (animated pulse during listening)
             Surface(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .scale(pulseScale),
                 shape = androidx.compose.foundation.shape.CircleShape,
-                color = getMoodColor(currentMood).copy(alpha = 0.2f)
+                color = coreColor.copy(alpha = 0.25f)
             ) {}
             // Core
             Surface(
                 modifier = Modifier.size(80.dp),
                 shape = androidx.compose.foundation.shape.CircleShape,
-                color = getMoodColor(currentMood)
+                color = coreColor
             ) {}
         }
 
-        Text(text = "Mood: $currentMood", style = MaterialTheme.typography.titleMedium, color = getMoodColor(currentMood))
-        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = "Mood: $currentMood",
+            style = MaterialTheme.typography.titleMedium,
+            color = getMoodColor(currentMood)
+        )
+        Spacer(modifier = Modifier.height(12.dp))
 
-        Text(text = "Status: $statusText", style = MaterialTheme.typography.bodyLarge)
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(text = "You said: $recognizedText", style = MaterialTheme.typography.bodyMedium)
-        Spacer(modifier = Modifier.height(32.dp))
+        Text(
+            text = "Status: $statusText",
+            style = MaterialTheme.typography.bodyLarge
+        )
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // Push-to-Talk Button
-        Surface(
+        Card(
             modifier = Modifier
-                .padding(16.dp)
-                .size(width = 200.dp, height = 60.dp)
-                .pointerInput(apiService) {
-                    awaitPointerEventScope {
-                        while (true) {
-                            val downEvent = awaitFirstDown()
-                            
-                            if (apiService != null && ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                isListening = true
-                                statusText = "Listening... (Release to send)"
-                                startListening(speechRecognizer, { text ->
-                                    isListening = false
-                                    recognizedText = text
-                                    statusText = "Sending..."
-                                    sendText(apiService, kittId, text, {
-                                        statusText = "Sent."
-                                    }, { sendErr ->
-                                        statusText = "Send Error: $sendErr"
-                                    })
-                                }, { errorCode ->
-                                    isListening = false
-                                    if (errorCode == SpeechRecognizer.ERROR_NO_MATCH || errorCode == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                                        statusText = "Canceled (No speech detected)"
-                                    } else {
-                                        statusText = "Error code: $errorCode"
-                                    }
-                                })
-                            } else if (apiService == null) {
-                                // Fallback info update
-                                statusText = "No Server URL!"
-                            } else {
-                                // Request permission if not granted
-                                // Cannot launch permission from within pointerInput easily, so we just prompt via text
-                                statusText = "Need Audio Permission!"
-                            }
-
-                            // Wait for ACTION_UP
-                            val upEvent = waitForUpOrCancellation()
-                            
-                            // Finger released
-                            if (isListening) {
-                                speechRecognizer.stopListening()
-                                isListening = false
-                                statusText = "Processing speech..."
-                            }
-                        }
-                    }
-                },
-            shape = MaterialTheme.shapes.extraLarge,
-            color = if (isListening) getMoodColor(currentMood).copy(alpha = 0.7f) else getMoodColor(currentMood),
-            shadowElevation = if (isListening) 2.dp else 8.dp
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+            )
         ) {
-            Box(contentAlignment = Alignment.Center) {
+            Column(modifier = Modifier.padding(12.dp)) {
                 Text(
-                    text = if (isListening) "Listening..." else "Hold to Talk",
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    style = MaterialTheme.typography.titleMedium
+                    text = "You said:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = if (recognizedText.isNotBlank()) recognizedText else "(Listening for your voice...)",
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 3
                 )
             }
         }
     }
 }
 
-fun startListening(
-    speechRecognizer: SpeechRecognizer,
-    onResult: (String) -> Unit,
-    onError: (Int) -> Unit
-) {
-    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-        // VAD (Voice Activity Detection) tuning parameters
-        // Request partial results so we know it's working
-        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        // Increase the silence lengths to prevent early timeout
-        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 10000L) // 10 seconds min
-        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L) // 5 seconds of silence allowed
-        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L)
-    }
-
-    speechRecognizer.setRecognitionListener(object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onError(error: Int) {
-            onError(error)
-        }
-
-        override fun onResults(results: Bundle?) {
-            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            if (!matches.isNullOrEmpty()) {
-                onResult(matches[0])
-            }
-        }
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            // We could update the UI with partial results here if we passed a callback,
-            // but for now just logging it to prove it's alive.
-            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            if (!matches.isNullOrEmpty()) {
-                Log.d("KittTalker", "Partial: ${matches[0]}")
-            }
-        }
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-    })
-
-    speechRecognizer.startListening(intent)
-}
-
-fun sendText(
-    apiService: KittApiService, 
-    id: String, 
-    text: String, 
-    onSuccess: () -> Unit,
+fun sendAudio(
+    apiService: KittApiService,
+    id: String,
+    wavBytes: ByteArray,
+    onSuccess: (KittAudioResponse) -> Unit,
     onError: (String) -> Unit
 ) {
-    apiService.talk(id, text).enqueue(object : Callback<KittContent> {
-        override fun onResponse(call: Call<KittContent>, response: Response<KittContent>) {
-            if (response.isSuccessful) {
-                onSuccess()
+    val mediaType = MediaType.parse("audio/wav")
+    val requestBody = RequestBody.create(mediaType, wavBytes)
+    val part = MultipartBody.Part.createFormData("audio", "speech.wav", requestBody)
+
+    apiService.talkAudio(id, part).enqueue(object : Callback<KittAudioResponse> {
+        override fun onResponse(call: Call<KittAudioResponse>, response: Response<KittAudioResponse>) {
+            if (response.isSuccessful && response.body() != null) {
+                onSuccess(response.body()!!)
             } else {
-                onError("HTTP ${response.code()}")
+                val errBody = response.errorBody()?.string() ?: response.message()
+                onError("HTTP ${response.code()}: $errBody")
             }
         }
-        override fun onFailure(call: Call<KittContent>, t: Throwable) {
-            Log.e("KittTalker", "Failed to send text", t)
-            onError(t.message ?: "Unknown error")
+
+        override fun onFailure(call: Call<KittAudioResponse>, t: Throwable) {
+            onError(t.localizedMessage ?: "Network error")
         }
     })
 }
@@ -481,27 +602,27 @@ fun pollForContent(apiService: KittApiService, id: String, onContentReceived: (K
     })
 }
 
-fun getMoodColor(mood: String?): androidx.compose.ui.graphics.Color {
+fun getMoodColor(mood: String?): Color {
     val m = (mood ?: "neutral").lowercase()
     return when {
         // Kitt's Top 3
-        m.contains("assisting") -> androidx.compose.ui.graphics.Color(0xFF00BCD4) // Cyan (Default)
-        m.contains("smug")      -> androidx.compose.ui.graphics.Color(0xFF9C27B0) // Purple
-        m.contains("kindly")    -> androidx.compose.ui.graphics.Color(0xFFFF80AB) // Pink
+        m.contains("assisting") -> Color(0xFF00BCD4) // Cyan (Default)
+        m.contains("smug")      -> Color(0xFF9C27B0) // Purple
+        m.contains("kindly")    -> Color(0xFFFF80AB) // Pink
 
         // Universal Emotions
-        m.contains("happy") || m.contains("joy") -> androidx.compose.ui.graphics.Color(0xFFFFC107) // Amber
-        m.contains("sad") || m.contains("cry")   -> androidx.compose.ui.graphics.Color(0xFF2196F3) // Blue
-        m.contains("angr") || m.contains("mad")  -> androidx.compose.ui.graphics.Color(0xFFF44336) // Red
-        m.contains("fear") || m.contains("scar") -> androidx.compose.ui.graphics.Color(0xFF673AB7) // Deep Purple
-        m.contains("surpris") || m.contains("shock") -> androidx.compose.ui.graphics.Color(0xFF4CAF50) // Green
-        m.contains("love") || m.contains("sedu") -> androidx.compose.ui.graphics.Color(0xFFE91E63) // Deep Pink
-        
+        m.contains("happy") || m.contains("joy") -> Color(0xFFFFC107) // Amber
+        m.contains("sad") || m.contains("cry")   -> Color(0xFF2196F3) // Blue
+        m.contains("angr") || m.contains("mad")  -> Color(0xFFF44336) // Red
+        m.contains("fear") || m.contains("scar") -> Color(0xFF673AB7) // Deep Purple
+        m.contains("surpris") || m.contains("shock") -> Color(0xFF4CAF50) // Green
+        m.contains("love") || m.contains("sedu") -> Color(0xFFE91E63) // Deep Pink
+
         // Others
-        m.contains("serious") || m.contains("cold") -> androidx.compose.ui.graphics.Color(0xFF607D8B) // Blue Grey
-        
+        m.contains("serious") || m.contains("cold") -> Color(0xFF607D8B) // Blue Grey
+
         // Default (Original Cyan)
-        else -> androidx.compose.ui.graphics.Color(0xFF00BCD4)
+        else -> Color(0xFF00BCD4)
     }
 }
 
@@ -509,12 +630,12 @@ fun playAudio(exoPlayer: ExoPlayer, baseUrl: String, audioPath: String) {
     Log.d("KittTalker", "DEBUG: Raw audioPath from server: $audioPath")
 
     var cleanedPath = audioPath
-    
+
     // 1. Remove "/app" if it's there (case for internal container paths)
     if (cleanedPath.startsWith("/app/")) {
         cleanedPath = cleanedPath.removePrefix("/app")
     }
-    
+
     // 2. Ensure it starts with "/" for consistent concatenation
     if (!cleanedPath.startsWith("/")) {
         cleanedPath = "/$cleanedPath"
