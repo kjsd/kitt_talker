@@ -2,6 +2,8 @@ package org.kandj.kitt_talker
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.util.Log
 import android.view.WindowManager
@@ -50,6 +52,9 @@ import retrofit2.Callback
 import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 enum class InteractionState {
@@ -93,9 +98,9 @@ class MainActivity : ComponentActivity() {
         if (!baseUrl.startsWith("http://") && !baseUrl.startsWith("https://")) return null
 
         val okHttpClient = OkHttpClient.Builder()
-            .readTimeout(60, TimeUnit.SECONDS)
-            .connectTimeout(60, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
             .build()
 
         return try {
@@ -172,6 +177,7 @@ fun KittScreen(
     var interactionState by remember { mutableStateOf(InteractionState.IDLE) }
     var statusText by remember { mutableStateOf(if (apiService == null) "Set Server URL" else "Initializing...") }
     var recognizedText by remember { mutableStateOf("") }
+    var lastErrorText by remember { mutableStateOf("") }
     var currentMood by remember { mutableStateOf("neutral") }
 
     // Kitt Selection State
@@ -183,6 +189,7 @@ fun KittScreen(
 
     val isAudioPlaying = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     val isSendingAudio = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val isPolling = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
 
     val currentApiService by rememberUpdatedState(apiService)
     val currentKittId by rememberUpdatedState(kittId)
@@ -209,14 +216,19 @@ fun KittScreen(
                     Log.i("KittTalker", "VAD: Speech ended (${wavBytes.size} bytes). Sending to Kitt...")
                     interactionState = InteractionState.SENDING
                     statusText = "Thinking..."
+                    // 会場で画面を見なくても「送信開始した」ことが耳で分かる確認音
+                    playSendBeep()
 
                     val service = currentApiService
                     val id = currentKittId
                     val url = currentBaseUrl
 
                     if (service == null) {
-                        isSendingAudio.set(false)
+                        lastErrorText = "[${formatNowTime()}] Server not connected"
                         statusText = "Error: Server not connected"
+                        playErrorBeep()
+                        delay(700)
+                        isSendingAudio.set(false)
                         interactionState = InteractionState.IDLE
                         return@launch
                     }
@@ -249,11 +261,14 @@ fun KittScreen(
                             }
                         },
                         onError = { error ->
-                            isSendingAudio.set(false)
                             Log.e("KittTalker", "STT Error: $error")
-                            statusText = "STT Error: $error"
+                            lastErrorText = "[${formatNowTime()}] $error"
+                            statusText = "STT Error (Auto-recovering...)"
                             scope.launch {
-                                delay(1500)
+                                // エラー音を鳴らしている間は isSendingAudio = true のまま維持してマイクがエラー音を拾うのを防ぐ
+                                playErrorBeep()
+                                delay(700)
+                                isSendingAudio.set(false)
                                 if (!isAudioPlaying.get() && interactionState != InteractionState.PLAYING) {
                                     interactionState = InteractionState.LISTENING
                                     statusText = "Listening (Ready)..."
@@ -353,10 +368,14 @@ fun KittScreen(
             override fun onPlayerError(error: PlaybackException) {
                 isAudioPlaying.set(false)
                 Log.e("KittTalker", "ExoPlayer Error: ${error.message}", error)
-                statusText = "Playback error"
+                lastErrorText = "[${formatNowTime()}] Playback error: ${error.message}"
+                statusText = "Playback error (Auto-recovering...)"
                 interactionState = InteractionState.IDLE
                 scope.launch {
-                    delay(1000)
+                    isSendingAudio.set(true)
+                    playErrorBeep()
+                    delay(800)
+                    isSendingAudio.set(false)
                     interactionState = InteractionState.LISTENING
                     statusText = "Listening (Ready)..."
                 }
@@ -365,6 +384,40 @@ fun KittScreen(
         exoPlayer.addListener(listener)
         onDispose {
             exoPlayer.removeListener(listener)
+        }
+    }
+
+    // Watchdog timer: WAITING_REPLY や SENDING で万が一固まった場合に自動復旧してエラートーンで知らせる
+    LaunchedEffect(interactionState) {
+        when (interactionState) {
+            InteractionState.WAITING_REPLY -> {
+                delay(25_000L)
+                if (interactionState == InteractionState.WAITING_REPLY) {
+                    Log.w("KittTalker", "Watchdog: Timeout waiting for TTS reply (25s). Auto-recovering to LISTENING.")
+                    lastErrorText = "[${formatNowTime()}] Reply timeout (TTS > 25s)"
+                    statusText = "Reply timeout (Auto-recovering...)"
+                    isSendingAudio.set(true)
+                    playErrorBeep()
+                    delay(700)
+                    isSendingAudio.set(false)
+                    interactionState = InteractionState.LISTENING
+                    statusText = "Listening (Ready)..."
+                }
+            }
+            InteractionState.SENDING -> {
+                delay(50_000L)
+                if (interactionState == InteractionState.SENDING) {
+                    Log.w("KittTalker", "Watchdog: Timeout sending audio (50s). Auto-recovering to LISTENING.")
+                    lastErrorText = "[${formatNowTime()}] Send timeout (> 50s)"
+                    statusText = "Send timeout (Auto-recovering...)"
+                    playErrorBeep()
+                    delay(700)
+                    isSendingAudio.set(false)
+                    interactionState = InteractionState.LISTENING
+                    statusText = "Listening (Ready)..."
+                }
+            }
+            else -> {}
         }
     }
 
@@ -388,14 +441,18 @@ fun KittScreen(
             val pollDelay = if (interactionState == InteractionState.WAITING_REPLY) 500L else 2000L
             delay(pollDelay)
 
-            // ユーザー発話中(HEARING)・送信中(SENDING)・再生中(PLAYING)はポーリングからの再生割り込みを避ける
+            // ユーザー発話中(HEARING)・送信中(SENDING)・再生中(PLAYING)および前回ポーリング未完了時はスキップ
             if (interactionState != InteractionState.HEARING &&
                 interactionState != InteractionState.SENDING &&
+                interactionState != InteractionState.PLAYING &&
                 !isSendingAudio.get() &&
+                !isAudioPlaying.get() &&
                 !exoPlayer.isPlaying &&
-                apiService != null
+                apiService != null &&
+                !isPolling.getAndSet(true)
             ) {
                 pollForContent(apiService, kittId) { content ->
+                    isPolling.set(false)
                     if (content != null && !content.audioPath.isNullOrBlank()) {
                         Log.i("KittTalker", "Received content from queue: ${content.message}")
                         interactionState = InteractionState.PLAYING
@@ -500,6 +557,7 @@ fun KittScreen(
                     indication = null
                 ) {
                     if (!exoPlayer.isPlaying && apiService != null) {
+                        isSendingAudio.set(false)
                         interactionState = InteractionState.LISTENING
                         statusText = "Listening (Ready)..."
                     }
@@ -556,7 +614,79 @@ fun KittScreen(
                 )
             }
         }
+
+        if (lastErrorText.isNotBlank()) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+                )
+            ) {
+                Column(modifier = Modifier.padding(10.dp)) {
+                    Text(
+                        text = "Last Error (Auto-recovered):",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Text(
+                        text = lastErrorText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        maxLines = 3
+                    )
+                }
+            }
+        }
     }
+}
+
+fun formatNowTime(): String {
+    return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+}
+
+/**
+ * 録音完了・サーバー送信開始時に鳴らす短い確認音（「ピピッ」）
+ */
+fun playSendBeep() {
+    Thread {
+        var toneGen: ToneGenerator? = null
+        try {
+            toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+            toneGen.startTone(ToneGenerator.TONE_PROP_ACK, 150)
+            Thread.sleep(200)
+        } catch (e: Exception) {
+            Log.e("KittTalker", "Failed to play send beep", e)
+        } finally {
+            try {
+                toneGen?.release()
+            } catch (_: Exception) {}
+        }
+    }.start()
+}
+
+/**
+ * エラーまたはタイムアウト発生時に鳴らす通知音（「ププー」）
+ */
+fun playErrorBeep() {
+    Thread {
+        var toneGen: ToneGenerator? = null
+        try {
+            toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 95)
+            toneGen.startTone(ToneGenerator.TONE_PROP_NACK, 220)
+            Thread.sleep(260)
+            toneGen.startTone(ToneGenerator.TONE_PROP_NACK, 220)
+            Thread.sleep(260)
+        } catch (e: Exception) {
+            Log.e("KittTalker", "Failed to play error beep", e)
+        } finally {
+            try {
+                toneGen?.release()
+            } catch (_: Exception) {}
+        }
+    }.start()
 }
 
 fun sendAudio(

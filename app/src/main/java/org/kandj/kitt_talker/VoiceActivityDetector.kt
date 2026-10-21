@@ -32,7 +32,8 @@ class VoiceActivityDetector(
     private var threshold = 800.0 // RMS threshold (External mic friendly)
     private val zcrThreshold = 0.25 // ZCR threshold
     private val minSpeechDurationMs = 250 // 0.25s 発話で開始判定
-    private val silenceDurationMs = 1800   // 1.8s 無音で終了判定
+    private val silenceDurationMs = 1200   // 1.2s 無音で終了判定 (外部マイクOFF後のレスポンス向上)
+    private val maxSpeechDurationMs = 15000 // 最大15sで強制区切り (会場ノイズでの無限録音・巨大WAV防止)
     private val minTotalAudioMs = 600      // 合計0.6s未満は短すぎるので捨てる
 
     private var isSpeaking = false
@@ -189,27 +190,36 @@ class VoiceActivityDetector(
                     Log.d("VAD", "Speech Detected! (RMS: ${rms.toInt()}, ZCR: ${String.format(java.util.Locale.US, "%.3f", zcr)})")
                 }
             }
-        } else {
-            if (isSpeaking && currentTime - lastSpeechTime > silenceDurationMs) {
-                val durationMs = lastSpeechTime - speechStartedTime
+        } else if (!isSpeaking) {
+            speechStartedTime = 0L
+        }
+
+        if (isSpeaking) {
+            audioBuffer.add(pcmChunk)
+
+            val isSilenceTimeout = (currentTime - lastSpeechTime) > silenceDurationMs
+            val isMaxDurationReached = (currentTime - speechStartedTime) > maxSpeechDurationMs
+
+            if (isSilenceTimeout || isMaxDurationReached) {
+                val endTime = if (isMaxDurationReached) currentTime else lastSpeechTime
+                val durationMs = endTime - speechStartedTime
                 isSpeaking = false
                 speechStartedTime = 0L
+                if (isMaxDurationReached) {
+                    // 会場ノイズ等で上限に達した場合、直後のチャンクで即座に再トリガーしないよう少しクールダウンを入れる
+                    lastMutedTime = currentTime
+                    Log.w("VAD", "Max speech duration (${maxSpeechDurationMs}ms) reached! Forcing audio send.")
+                }
 
-                if (durationMs > minTotalAudioMs) {
+                if (durationMs > minTotalAudioMs && audioBuffer.isNotEmpty()) {
                     val fullAudio = combineBuffers()
-                    Log.i("VAD", "Speech Ended (${fullAudio.size / 32000.0}s of audio), sending...")
+                    Log.i("VAD", "Speech Ended (${String.format(java.util.Locale.US, "%.1f", fullAudio.size / 32000.0)}s of audio, maxCut=$isMaxDurationReached), sending...")
                     onSpeechEnded(fullAudio)
                 } else {
                     Log.d("VAD", "Speech discarded: too short (${durationMs}ms)")
                 }
                 audioBuffer.clear()
-            } else if (!isSpeaking) {
-                speechStartedTime = 0L
             }
-        }
-
-        if (isSpeaking) {
-            audioBuffer.add(pcmChunk)
         } else {
             // 未発話時は最新の数チャンク（約400ms）をリングバッファに保持
             synchronized(preRollBuffer) {
