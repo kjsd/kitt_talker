@@ -28,13 +28,15 @@ class VoiceActivityDetector(
     private var isRunning = false
     private var vadJob: Job? = null
 
-    // VAD Parameters
-    private var threshold = 800.0 // RMS threshold (External mic friendly)
-    private val zcrThreshold = 0.25 // ZCR threshold
-    private val minSpeechDurationMs = 250 // 0.25s 発話で開始判定
-    private val silenceDurationMs = 1200   // 1.2s 無音で終了判定 (外部マイクOFF後のレスポンス向上)
-    private val maxSpeechDurationMs = 15000 // 最大15sで強制区切り (会場ノイズでの無限録音・巨大WAV防止)
-    private val minTotalAudioMs = 600      // 合計0.6s未満は短すぎるので捨てる
+    // VAD Parameters (Hysteresis: 開始判定はノイズ耐性重視、発話中の継続判定は語尾・息継ぎに寛容にする)
+    private var startThreshold = 800.0      // 発話開始のRMSしきい値
+    private var continueThreshold = 450.0   // 発話継続中のRMSしきい値 (小声や語尾でも途切れないように緩和)
+    private val startZcrThreshold = 0.25    // 発話開始のZCRしきい値
+    private val continueZcrThreshold = 0.40 // 発話継続中のZCRしきい値 (子音や息混じりの声も許容)
+    private val minSpeechDurationMs = 250   // 0.25s 発話で開始判定
+    private val silenceDurationMs = 2300    // 2.3s 無音で終了判定 (子供の息継ぎや「えーっと」の間を許容)
+    private val maxSpeechDurationMs = 20000 // 最大20sで強制区切り (会場ノイズでの無限録音・巨大WAV防止)
+    private val minTotalAudioMs = 600       // 合計0.6s未満は短すぎるので捨てる
 
     private var isSpeaking = false
     private var lastSpeechTime = 0L
@@ -170,7 +172,10 @@ class VoiceActivityDetector(
         val rms = calculateRMS(filteredShorts, size)
         val zcr = calculateZCR(filteredShorts, size)
 
-        if (rms > threshold && zcr < zcrThreshold) {
+        val activeThreshold = if (isSpeaking) continueThreshold else startThreshold
+        val activeZcrThreshold = if (isSpeaking) continueZcrThreshold else startZcrThreshold
+
+        if (rms > activeThreshold && zcr < activeZcrThreshold) {
             lastSpeechTime = currentTime
 
             if (!isSpeaking) {
