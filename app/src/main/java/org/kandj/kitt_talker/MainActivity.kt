@@ -421,18 +421,27 @@ fun KittScreen(
         }
     }
 
-    // Initial load of Kitts (Reload when baseUrl changes)
-    LaunchedEffect(baseUrl) {
+    val loadKitts: (((List<Kitt>) -> Unit)?) -> Unit = { onLoaded ->
         apiService?.getKitts()?.enqueue(object : Callback<List<Kitt>> {
             override fun onResponse(call: Call<List<Kitt>>, response: Response<List<Kitt>>) {
                 if (response.isSuccessful) {
-                    kitts = response.body() ?: emptyList()
+                    val list = response.body() ?: emptyList()
+                    kitts = list
+                    if (list.isNotEmpty() && list.none { it.id == currentKittId }) {
+                        onKittSelected(list.first().id)
+                    }
+                    onLoaded?.invoke(list)
                 }
             }
             override fun onFailure(call: Call<List<Kitt>>, t: Throwable) {
                 Log.e("KittTalker", "Failed to load kitts", t)
             }
         })
+    }
+
+    // Initial load of Kitts (Reload when baseUrl changes)
+    LaunchedEffect(baseUrl) {
+        loadKitts(null)
     }
 
     // Polling effect: 返答待ち時は 500ms、通常時は 2000ms でポーリング
@@ -508,24 +517,45 @@ fun KittScreen(
             isError = apiService == null
         )
 
-        // Kitt Selector
-        ExposedDropdownMenuBox(
-            expanded = expanded,
-            onExpandedChange = { expanded = !expanded },
-            modifier = Modifier.padding(bottom = 24.dp)
+        // Kitt Selector (enabled = false + Box.clickable により指の微細なブレでタップがキャンセルされるのを防止)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 24.dp)
+                .clickable {
+                    if (kitts.isEmpty()) {
+                        loadKitts { list ->
+                            if (list.isNotEmpty()) {
+                                expanded = true
+                            }
+                        }
+                    } else {
+                        val nextExpanded = !expanded
+                        expanded = nextExpanded
+                        if (nextExpanded) {
+                            loadKitts(null)
+                        }
+                    }
+                }
         ) {
             val selectedKitt = kitts.find { it.id == kittId }
             TextField(
                 value = selectedKitt?.name ?: "Select Kitt",
                 onValueChange = {},
+                enabled = false,
                 readOnly = true,
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                colors = ExposedDropdownMenuDefaults.textFieldColors(),
-                modifier = Modifier.menuAnchor(),
+                colors = ExposedDropdownMenuDefaults.textFieldColors(
+                    disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                    disabledTrailingIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    disabledIndicatorColor = MaterialTheme.colorScheme.onSurfaceVariant
+                ),
+                modifier = Modifier.fillMaxWidth(),
                 textStyle = MaterialTheme.typography.bodyMedium
             )
-            ExposedDropdownMenu(
-                expanded = expanded,
+            DropdownMenu(
+                expanded = expanded && kitts.isNotEmpty(),
                 onDismissRequest = { expanded = false }
             ) {
                 kitts.forEach { kitt ->
