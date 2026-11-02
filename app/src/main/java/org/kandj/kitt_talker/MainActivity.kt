@@ -39,13 +39,18 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.MediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
 import org.kandj.kitt_talker.ui.theme.KittTalkerTheme
 import retrofit2.Call
 import retrofit2.Callback
@@ -190,6 +195,18 @@ fun KittScreen(
     val isAudioPlaying = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     val isSendingAudio = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     val isPolling = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val isWsConnected = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val isStreamComplete = remember { java.util.concurrent.atomic.AtomicBoolean(true) }
+    var wsConnectedState by remember { mutableStateOf(false) }
+    var isForeground by remember { mutableStateOf(true) }
+
+    val wsClient = remember {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
+            .build()
+    }
 
     val currentApiService by rememberUpdatedState(apiService)
     val currentKittId by rememberUpdatedState(kittId)
@@ -249,12 +266,18 @@ fun KittScreen(
                                 currentMood = res.mood ?: "neutral"
 
                                 if (!res.audioPath.isNullOrBlank()) {
-                                    // 音声パスが即座に返ってきた場合
-                                    interactionState = InteractionState.PLAYING
-                                    statusText = "Kitt is talking..."
-                                    playAudio(exoPlayer, url, res.audioPath)
-                                } else {
-                                    // 非同期TTS生成中の場合、ポーリングで待機
+                                    // 音声パスが即座に返ってきた場合 (WS未接続時の同期フォールバック)
+                                    if (!isWsConnected.get() && !exoPlayer.isPlaying && exoPlayer.mediaItemCount == 0) {
+                                        isStreamComplete.set(true)
+                                        interactionState = InteractionState.PLAYING
+                                        statusText = "Kitt is talking..."
+                                        enqueueOrPlayAudio(exoPlayer, url, res.audioPath)
+                                    }
+                                } else if (interactionState != InteractionState.PLAYING &&
+                                    !isAudioPlaying.get() &&
+                                    exoPlayer.mediaItemCount == 0
+                                ) {
+                                    // 非同期TTS生成中の場合、WSプッシュまたはポーリングで待機
                                     interactionState = InteractionState.WAITING_REPLY
                                     statusText = "Kitt is thinking..."
                                 }
@@ -309,6 +332,7 @@ fun KittScreen(
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME -> {
+                    isForeground = true
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         vad.start()
                         if (interactionState == InteractionState.IDLE) {
@@ -320,6 +344,7 @@ fun KittScreen(
                     }
                 }
                 Lifecycle.Event.ON_PAUSE -> {
+                    isForeground = false
                     vad.stop()
                     if (interactionState == InteractionState.LISTENING || interactionState == InteractionState.HEARING) {
                         interactionState = InteractionState.IDLE
@@ -347,15 +372,24 @@ fun KittScreen(
                 when (playbackState) {
                     Player.STATE_ENDED -> {
                         isAudioPlaying.set(false)
-                        Log.d("KittTalker", "ExoPlayer: Playback Ended")
-                        interactionState = InteractionState.IDLE
-                        statusText = "Finished speaking."
+                        exoPlayer.clearMediaItems()
+                        if (!isStreamComplete.get()) {
+                            Log.d("KittTalker", "ExoPlayer: Chunk ended, waiting for remaining TTS chunks...")
+                            interactionState = InteractionState.WAITING_REPLY
+                            statusText = "Kitt is thinking..."
+                        } else {
+                            Log.d("KittTalker", "ExoPlayer: Playback Ended")
+                            interactionState = InteractionState.IDLE
+                            statusText = "Finished speaking."
 
-                        // エコー防止（残響カット）のため 600ms 待機してから待受復帰
-                        scope.launch {
-                            delay(600)
-                            interactionState = InteractionState.LISTENING
-                            statusText = "Listening (Ready)..."
+                            // エコー防止（残響カット）のため 600ms 待機してから待受復帰
+                            scope.launch {
+                                delay(600)
+                                if (!exoPlayer.isPlaying && exoPlayer.mediaItemCount == 0) {
+                                    interactionState = InteractionState.LISTENING
+                                    statusText = "Listening (Ready)..."
+                                }
+                            }
                         }
                     }
                     Player.STATE_READY -> {
@@ -367,6 +401,8 @@ fun KittScreen(
 
             override fun onPlayerError(error: PlaybackException) {
                 isAudioPlaying.set(false)
+                isStreamComplete.set(true)
+                exoPlayer.clearMediaItems()
                 Log.e("KittTalker", "ExoPlayer Error: ${error.message}", error)
                 lastErrorText = "[${formatNowTime()}] Playback error: ${error.message}"
                 statusText = "Playback error (Auto-recovering...)"
@@ -444,19 +480,148 @@ fun KittScreen(
         loadKitts(null)
     }
 
-    // Polling effect: 返答待ち時は 500ms、通常時は 2000ms でポーリング
+    // WebSocket connection effect: フォアグラウンド中は常時WS接続を維持し、チャンク単位で最速再生
+    LaunchedEffect(baseUrl, kittId, isForeground) {
+        if (!isForeground || apiService == null || baseUrl.isBlank() || kittId.isBlank()) {
+            isWsConnected.set(false)
+            wsConnectedState = false
+            return@LaunchedEffect
+        }
+
+        val cleanBase = baseUrl.trim().trimEnd('/')
+        val wsBase = when {
+            cleanBase.startsWith("https://") -> "wss://" + cleanBase.removePrefix("https://")
+            cleanBase.startsWith("http://") -> "ws://" + cleanBase.removePrefix("http://")
+            else -> return@LaunchedEffect
+        }
+        val wsUrl = "$wsBase/kitts/$kittId/ws"
+
+        while (true) {
+            val disconnectSignal = CompletableDeferred<Unit>()
+            var currentSocket: WebSocket? = null
+            try {
+                Log.i("KittTalker", "WS: Connecting to $wsUrl")
+                val request = Request.Builder().url(wsUrl).build()
+                currentSocket = wsClient.newWebSocket(request, object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+                        Log.i("KittTalker", "WS: Connected ($wsUrl)")
+                        isWsConnected.set(true)
+                        scope.launch(Dispatchers.Main) {
+                            wsConnectedState = true
+                        }
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        try {
+                            val obj = JSONObject(text)
+                            val type = obj.optString("type", "")
+                            scope.launch(Dispatchers.Main) {
+                                when (type) {
+                                    "stt" -> {
+                                        val userText = obj.optString("text", "")
+                                        if (userText.isNotBlank()) {
+                                            recognizedText = userText
+                                            if (interactionState != InteractionState.PLAYING) {
+                                                statusText = "Kitt is thinking..."
+                                            }
+                                        }
+                                    }
+                                    "talk_chunk" -> {
+                                        val audioPath = obj.optString("audio_path", "")
+                                        val mood = obj.optString("mood", "neutral")
+                                        val isLast = obj.optBoolean("is_last", false)
+                                        val chunkIdx = obj.optInt("chunk_index", 0)
+                                        if (audioPath.isNotBlank()) {
+                                            Log.i("KittTalker", "WS: Received talk_chunk[$chunkIdx] (isLast=$isLast): $audioPath")
+                                            isStreamComplete.set(isLast)
+                                            currentMood = mood.ifBlank { "neutral" }
+                                            interactionState = InteractionState.PLAYING
+                                            statusText = "Kitt is talking..."
+                                            enqueueOrPlayAudio(exoPlayer, currentBaseUrl, audioPath)
+                                        }
+                                    }
+                                    "talk" -> {
+                                        val audioPath = obj.optString("audio_path", "")
+                                        val mood = obj.optString("mood", "neutral")
+                                        if (audioPath.isNotBlank()) {
+                                            Log.i("KittTalker", "WS: Received talk: $audioPath")
+                                            isStreamComplete.set(true)
+                                            currentMood = mood.ifBlank { "neutral" }
+                                            interactionState = InteractionState.PLAYING
+                                            statusText = "Kitt is talking..."
+                                            enqueueOrPlayAudio(exoPlayer, currentBaseUrl, audioPath)
+                                        }
+                                    }
+                                    "talk_complete" -> {
+                                        Log.i("KittTalker", "WS: Received talk_complete")
+                                        isStreamComplete.set(true)
+                                        if (!exoPlayer.isPlaying &&
+                                            exoPlayer.playbackState != Player.STATE_BUFFERING &&
+                                            exoPlayer.mediaItemCount == 0 &&
+                                            interactionState == InteractionState.WAITING_REPLY
+                                        ) {
+                                            delay(600)
+                                            if (!exoPlayer.isPlaying && exoPlayer.mediaItemCount == 0) {
+                                                interactionState = InteractionState.LISTENING
+                                                statusText = "Listening (Ready)..."
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e("KittTalker", "WS: Failed to parse message: $text", e)
+                        }
+                    }
+
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(1000, null)
+                        isWsConnected.set(false)
+                        scope.launch(Dispatchers.Main) { wsConnectedState = false }
+                        disconnectSignal.complete(Unit)
+                    }
+
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        Log.i("KittTalker", "WS: Closed ($code: $reason)")
+                        isWsConnected.set(false)
+                        scope.launch(Dispatchers.Main) { wsConnectedState = false }
+                        disconnectSignal.complete(Unit)
+                    }
+
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
+                        Log.w("KittTalker", "WS: Failure (${t.message})")
+                        isWsConnected.set(false)
+                        scope.launch(Dispatchers.Main) { wsConnectedState = false }
+                        disconnectSignal.complete(Unit)
+                    }
+                })
+                disconnectSignal.await()
+            } finally {
+                isWsConnected.set(false)
+                wsConnectedState = false
+                try {
+                    currentSocket?.close(1000, "Disconnecting")
+                } catch (_: Exception) {}
+            }
+            delay(2000L)
+        }
+    }
+
+    // Fallback Polling effect: WS未接続時のみ、返答待ち時は 500ms、通常時は 2000ms でポーリング
     LaunchedEffect(baseUrl, kittId) {
         while (true) {
             val pollDelay = if (interactionState == InteractionState.WAITING_REPLY) 500L else 2000L
             delay(pollDelay)
 
-            // ユーザー発話中(HEARING)・送信中(SENDING)・再生中(PLAYING)および前回ポーリング未完了時はスキップ
-            if (interactionState != InteractionState.HEARING &&
+            // WS接続中、またはユーザー発話中(HEARING)・送信中(SENDING)・再生中(PLAYING)および前回ポーリング未完了時はスキップ
+            if (!isWsConnected.get() &&
+                interactionState != InteractionState.HEARING &&
                 interactionState != InteractionState.SENDING &&
                 interactionState != InteractionState.PLAYING &&
                 !isSendingAudio.get() &&
                 !isAudioPlaying.get() &&
                 !exoPlayer.isPlaying &&
+                exoPlayer.mediaItemCount == 0 &&
                 apiService != null &&
                 !isPolling.getAndSet(true)
             ) {
@@ -464,10 +629,11 @@ fun KittScreen(
                     isPolling.set(false)
                     if (content != null && !content.audioPath.isNullOrBlank()) {
                         Log.i("KittTalker", "Received content from queue: ${content.message}")
+                        isStreamComplete.set(true)
                         interactionState = InteractionState.PLAYING
                         statusText = "Kitt is talking..."
                         currentMood = content.mood ?: "neutral"
-                        playAudio(exoPlayer, baseUrl, content.audioPath)
+                        enqueueOrPlayAudio(exoPlayer, baseUrl, content.audioPath)
                     }
                 }
             }
@@ -618,7 +784,7 @@ fun KittScreen(
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "Status: $statusText",
+            text = "Status: $statusText" + if (wsConnectedState) " [WS]" else "",
             style = MaterialTheme.typography.bodyLarge
         )
         Spacer(modifier = Modifier.height(8.dp))
@@ -786,7 +952,7 @@ fun getMoodColor(mood: String?): Color {
     }
 }
 
-fun playAudio(exoPlayer: ExoPlayer, baseUrl: String, audioPath: String) {
+fun enqueueOrPlayAudio(exoPlayer: ExoPlayer, baseUrl: String, audioPath: String) {
     Log.d("KittTalker", "DEBUG: Raw audioPath from server: $audioPath")
 
     var cleanedPath = audioPath
@@ -807,7 +973,21 @@ fun playAudio(exoPlayer: ExoPlayer, baseUrl: String, audioPath: String) {
     Log.d("KittTalker", "DEBUG: Final Playback URL: $fullUrl")
 
     val mediaItem = MediaItem.fromUri(fullUrl)
-    exoPlayer.setMediaItem(mediaItem)
-    exoPlayer.prepare()
-    exoPlayer.play()
+    if (exoPlayer.playbackState == Player.STATE_IDLE ||
+        exoPlayer.playbackState == Player.STATE_ENDED ||
+        exoPlayer.mediaItemCount == 0
+    ) {
+        exoPlayer.setMediaItem(mediaItem)
+        exoPlayer.prepare()
+        exoPlayer.play()
+    } else {
+        exoPlayer.addMediaItem(mediaItem)
+        if (!exoPlayer.isPlaying && exoPlayer.playbackState == Player.STATE_READY) {
+            exoPlayer.play()
+        }
+    }
+}
+
+fun playAudio(exoPlayer: ExoPlayer, baseUrl: String, audioPath: String) {
+    enqueueOrPlayAudio(exoPlayer, baseUrl, audioPath)
 }
